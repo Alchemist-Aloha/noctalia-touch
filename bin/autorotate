@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Auto-rotate the tablet panel + touchscreen in Hyprland using iio-sensor-proxy.
+#   autorotate.sh               run the watcher (started from tablet.lua)
+#   autorotate.sh --toggle-lock toggle rotation lock
+#   autorotate.sh --reapply     re-apply the last orientation (after a config reload)
+#
+# The panel is natively portrait. If landscape comes out upside-down for you,
+# swap the values for left-up and right-up below.
+
+OUTPUT="@OUTPUT@"
+SCALE="@SCALE@"
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/noctalia-touch-rotation-lock"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/noctalia-touch-rotation-transform"
+
+declare -A TRANSFORM=(
+    [normal]=0      # portrait
+    [left-up]=1     # landscape (90°)
+    [bottom-up]=2   # portrait, upside down
+    [right-up]=3    # landscape (270°)
+)
+
+notify() { noctalia msg notification-show "Rotation" "$1" >/dev/null 2>&1; }
+
+if [[ ${1:-} == --toggle-lock ]]; then
+    if [[ -e $LOCK ]]; then rm -f "$LOCK"; notify "Auto-rotate on"
+    else touch "$LOCK"; notify "Rotation locked"; fi
+    exit 0
+fi
+
+set_transform() {
+    hyprctl eval "hl.monitor({ output = '$OUTPUT', mode = 'preferred', position = '0x0', scale = $SCALE, transform = $1 })
+                  hl.config({ input = { touchdevice = { output = '$OUTPUT', transform = $1 } } })" >/dev/null
+    if [[ $? == 0 ]]; then echo "$1" > "$STATE"; fi
+}
+
+if [[ ${1:-} == --reapply ]]; then
+    [[ -s $STATE ]] && set_transform "$(<"$STATE")"
+    exit 0
+fi
+
+apply() {
+    local t=${TRANSFORM[$1]}
+    [[ -z $t || -e $LOCK || $t == "$current" ]] && return
+    current=$t
+    set_transform "$t"
+}
+
+# Only one watcher at a time
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/noctalia-touch-autorotate.lock"
+flock -n 9 || exit 0
+
+current=""
+# Preserve the current monitor mode until the sensor reports an orientation.
+
+monitor-sensor --accel 2>/dev/null | while read -r line; do
+    case $line in
+        *"orientation: "*)          o=${line##*orientation: }; o=${o%)} ;;
+        *"orientation changed: "*)  o=${line##*changed: } ;;
+        *) continue ;;
+    esac
+    apply "$o"
+done

@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""floatkb - a floating, draggable on-screen keyboard for Hyprland.
+
+It is a layer-shell overlay that never takes keyboard focus, so taps go to
+whatever app was focused. Keystrokes are sent with `wtype`.
+
+  floatkb            start (or expand it if already running)
+  floatkb --toggle   expand / collapse the running keyboard
+
+Drag the handle to move it. Minus and plus resize it. Hide collapses
+it to a pill. Position and preferred size are saved.
+"""
+import json
+import os
+import queue
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PIDFILE = os.path.join(RUN, "noctalia-touch-floatkb.pid")
+STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                     "noctalia-touch", "keyboard-state.json")
+
+
+def running_pid():
+    try:
+        pid = int(open(PIDFILE).read())
+        if b"floatkb" in open(f"/proc/{pid}/cmdline", "rb").read() and pid != os.getpid():
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+pid = running_pid()
+if pid:
+    os.kill(pid, signal.SIGUSR1 if "--toggle" in sys.argv else signal.SIGUSR2)
+    sys.exit(0)
+
+# gtk4-layer-shell must be loaded before libwayland-client
+PRELOAD = "libgtk4-layer-shell.so.0"
+if PRELOAD not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = " ".join(filter(None, [PRELOAD, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LS  # noqa: E402
+
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix  # noqa: E402
+    signal_add = GLibUnix.signal_add
+except (ImportError, ValueError):
+    signal_add = GLib.unix_signal_add
+
+# ---- layouts --------------------------------------------------------------
+# A key is either a 1-char string (typed as-is) or (label, action, width).
+# Actions starting with "@" are specials; "@<Keysym>" sends that keysym.
+ARROWS = [("←", "@Left", 1), ("↓", "@Down", 1), ("↑", "@Up", 1), ("→", "@Right", 1)]
+BOTTOM = lambda switch: [(switch, "@sym", 1.5), ("Ctrl", "@ctrl", 1), ("Alt", "@alt", 1),
+                         ("Space", "@space", 4)] + ARROWS
+
+LETTERS = [
+    list("qwertyuiop") + [("⌫", "@BackSpace", 1.5)],
+    [("⇥", "@Tab", 1)] + list("asdfghjkl") + [("⏎", "@Return", 1.5)],
+    [("⇧", "@shift", 1.5)] + list("zxcvbnm,.") + [("⇧", "@shift", 1)],
+    BOTTOM("?123"),
+]
+SYMBOLS = [
+    list("1234567890") + [("⌫", "@BackSpace", 1.5)],
+    list("!@#$%^&*()") + [("⏎", "@Return", 1.5)],
+    [("Esc", "@Escape", 1.5)] + list("-_=+[]{}\\|"),
+    [("⇥", "@Tab", 1.5)] + list(";:'\"/?<>`~"),
+    BOTTOM("abc"),
+]
+REPEAT = {"@BackSpace", "@Left", "@Right", "@Up", "@Down", "@space"}
+MODS = {"@ctrl": "ctrl", "@alt": "alt"}
+GAP = 5
+PADDING = 8
+MIN_UNIT = 28
+MAX_UNIT = 72
+MAX_ROW = max(sum(1 if isinstance(key, str) else key[2] for key in row)
+              for row in LETTERS + SYMBOLS)
+REPEAT_DELAY = 400
+REPEAT_INTERVAL = 65
+
+CSS = """
+.kb      {{ background: #1b1d25; border-radius: 14px; padding: {padding}px;
+            border: 1px solid #444858; }}
+.grip    {{ background: #71778a; border-radius: 3px; min-width: 44px; min-height: 5px; }}
+.barbtn  {{ color: #e3e6f1; font-size: {gf}px; border-radius: 8px;
+            background: #303442; min-height: 36px; min-width: 34px; padding: 0 9px; }}
+.barbtn:active {{ background: #acc6ff; color: #141e34; }}
+.barbtn:disabled {{ color: #9298a9; background: #252833; }}
+.key     {{ background: #333747; color: #f4f5fb; border-radius: 8px;
+            font-size: {fs}px; }}
+.key.mod {{ background: #282c39; font-size: {ms}px; }}
+.key.primary {{ background: #40547c; }}
+.key.latched, .key.pressed {{ background: #acc6ff; color: #141e34; }}
+"""
+
+
+def keysym_for(ch):
+    return Gdk.keyval_name(Gdk.unicode_to_keyval(ord(ch)))
+
+
+class FloatKB(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=None, flags=0)
+        self.state = {"left": 40, "bottom": 40, "unit": 44, "expanded": "--collapsed" not in sys.argv}
+        try:
+            with open(STATE) as state_file:
+                saved = json.load(state_file)
+            for key in ("left", "bottom", "unit"):
+                if type(saved.get(key)) is int:
+                    self.state[key] = max(0, saved[key])
+            if type(saved.get("expanded")) is bool:
+                self.state["expanded"] = saved["expanded"]
+        except (AttributeError, OSError, ValueError):
+            pass
+        self.state["unit"] = min(MAX_UNIT, max(MIN_UNIT, self.state["unit"]))
+        self.unit = self.state["unit"]
+        self.position = (0, 0)
+        if "--collapsed" in sys.argv:
+            self.state["expanded"] = False
+        self.mode, self.shift, self.caps, self.last_shift = "abc", False, False, 0.0
+        self.mods = set()
+        self.rep = None
+        self.repeat_owner = None
+        self.q = queue.Queue()
+        self.warned = False
+        threading.Thread(target=self.worker, daemon=True).start()
+
+    # ---- typing ---------------------------------------------------------
+    def worker(self):
+        while True:
+            args = self.q.get()
+            try:
+                subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except FileNotFoundError:
+                GLib.idle_add(self.warn_wtype)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def warn_wtype(self):
+        if not self.warned:
+            self.warned = True
+            subprocess.Popen(["noctalia", "msg", "notification-show", "Keyboard",
+                              "Install wtype to send keystrokes"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def send(self, keysym, shift=False):
+        args = ["wtype"]
+        modifiers = sorted(self.mods | ({"shift"} if shift else set()))
+        for m in modifiers:
+            args += ["-M", m]
+        args += ["-k", keysym]
+        for m in reversed(modifiers):
+            args += ["-m", m]
+        self.q.put(args)
+
+    # ---- key handling ----------------------------------------------------
+    def act(self, action):
+        if action == "@shift":
+            now = time.monotonic()
+            if self.caps:
+                self.caps = self.shift = False
+            elif self.shift and now - self.last_shift < 0.4:
+                self.caps = True
+            else:
+                self.shift = not self.shift
+            self.last_shift = now
+            self.update_keys()
+            return
+        if action == "@sym":
+            self.mode = "sym" if self.mode == "abc" else "abc"
+            GLib.idle_add(self.build_keys)
+            return
+        if action in MODS:
+            self.mods ^= {MODS[action]}
+            self.update_keys()
+            return
+
+        if action.startswith("@"):
+            self.send("space" if action == "@space" else action[1:], shift=self.shift and not self.caps)
+        else:
+            ch = action.upper() if (self.shift or self.caps) and not self.mods else action
+            self.send(keysym_for(ch), shift=bool(self.mods) and self.shift and not self.caps)
+
+        self.mods.clear()
+        if not self.caps:
+            self.shift = False
+        self.update_keys()
+
+    def on_press(self, widget, action):
+        widget.add_css_class("pressed")
+        self.stop_repeat()
+        self.act(action)
+        if action in REPEAT:
+            self.repeat_owner = widget
+
+            def repeat():
+                # Leave room for fresh taps if the compositor is slow.
+                if self.q.empty():
+                    self.act(action)
+                return True
+
+            def start():
+                repeat()
+                self.rep = GLib.timeout_add(REPEAT_INTERVAL, repeat)
+                return False
+
+            self.rep = GLib.timeout_add(REPEAT_DELAY, start)
+
+    def on_release(self, widget):
+        widget.remove_css_class("pressed")
+        if self.repeat_owner is widget:
+            self.stop_repeat()
+
+    def stop_repeat(self):
+        if self.rep is not None:
+            GLib.source_remove(self.rep)
+            self.rep = None
+        self.repeat_owner = None
+
+    def tappable(self, widget, action):
+        gesture = Gtk.GestureClick()
+        gesture.set_button(1)
+        gesture.connect("pressed", lambda *_: self.on_press(widget, action))
+        for event in ("released", "cancel", "unpaired-release"):
+            gesture.connect(event, lambda *_: self.on_release(widget))
+        widget.add_controller(gesture)
+
+    # ---- UI ---------------------------------------------------------------
+    def do_activate(self):
+        win = self.win = Gtk.Window(application=self)
+        LS.init_for_window(win)
+        LS.set_namespace(win, "floatkb")
+        LS.set_layer(win, LS.Layer.OVERLAY)
+        LS.set_keyboard_mode(win, LS.KeyboardMode.NONE)
+        LS.set_anchor(win, LS.Edge.BOTTOM, True)
+        LS.set_anchor(win, LS.Edge.LEFT, True)
+        self.panel = next((monitor for monitor in win.get_display().get_monitors()
+                           if monitor.get_connector() == "@OUTPUT@"), None)
+        if self.panel is not None:
+            LS.set_monitor(win, self.panel)
+        win.connect("unmap", lambda *_: self.stop_repeat())
+
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=GAP)
+        root.add_css_class("kb")
+        win.set_child(root)
+
+        bar = Gtk.Box(spacing=6)
+        grip = Gtk.Box(hexpand=True, width_request=68, height_request=40)
+        grip.set_cursor_from_name("grab")
+        grip.set_tooltip_text("Drag to move the keyboard")
+        handle = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, hexpand=True)
+        handle.add_css_class("grip")
+        grip.append(handle)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-update", self.on_drag)
+        drag.connect("drag-begin", self.begin_drag)
+        drag.connect("drag-end", self.end_drag)
+        grip.add_controller(drag)
+        bar.append(grip)
+
+        self.btn_small = self.bar_button("−", "Smaller keys", lambda: self.resize(-4))
+        self.btn_big = self.bar_button("+", "Larger keys", lambda: self.resize(+4))
+        self.btn_fold = self.bar_button("Hide", "Hide keyboard", self.toggle)
+        for b in (self.btn_small, self.btn_big, self.btn_fold):
+            bar.append(b)
+        root.append(bar)
+
+        self.keys = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=GAP)
+        root.append(self.keys)
+
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, lambda: (self.toggle(), True)[1])
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda: (self.set_expanded(True), True)[1])
+        signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (self.quit(), False)[1])
+        GLib.timeout_add(1000, lambda: (self.clamp(), True)[1])   # keep on-screen after rotation
+
+        self.set_expanded(self.state["expanded"], save=False)
+        self.clamp()
+        win.present()
+
+    def bar_button(self, text, tooltip, callback):
+        button = Gtk.Button(label=text, focusable=False)
+        button.add_css_class("barbtn")
+        button.set_tooltip_text(tooltip)
+        button.connect("clicked", lambda *_: callback())
+        return button
+
+    def apply_size(self, geometry):
+        limit = MAX_UNIT
+        if geometry is not None:
+            # Both layers use the same size, so switching symbols never shifts the keyboard.
+            limit = min(limit, int((geometry.width - 2 * PADDING - 2 + GAP) / MAX_ROW) - GAP,
+                        int((geometry.height - 140) / 5.25))
+        self.size_limit = max(MIN_UNIT, limit)
+        unit = min(self.size_limit, self.state["unit"])
+        self.btn_small.set_sensitive(unit > MIN_UNIT)
+        self.btn_big.set_sensitive(unit < self.size_limit)
+        if getattr(self, "key_views", None) and self.unit == unit:
+            return
+        self.unit = unit
+        self.css.load_from_string(CSS.format(fs=int(unit * 0.46), ms=int(unit * 0.33),
+                                             gf=max(14, int(unit * 0.32)), padding=PADDING))
+        self.build_keys()
+
+    def build_keys(self):
+        self.stop_repeat()
+        self.key_views = []
+        while (child := self.keys.get_first_child()):
+            self.keys.remove(child)
+        for row in (LETTERS if self.mode == "abc" else SYMBOLS):
+            hbox = Gtk.Box(spacing=GAP, halign=Gtk.Align.CENTER)
+            for key in row:
+                label, action, width = (key, key, 1) if isinstance(key, str) else key
+                widget = Gtk.Label(label=label)
+                widget.add_css_class("key")
+                if action.startswith("@"):
+                    widget.add_css_class("mod")
+                if action in {"@Return", "@BackSpace"}:
+                    widget.add_css_class("primary")
+                widget.set_size_request(int((self.unit + GAP) * width - GAP), int(self.unit * 1.05))
+                self.tappable(widget, action)
+                self.key_views.append((widget, label, action))
+                hbox.append(widget)
+            self.keys.append(hbox)
+        self.update_keys()
+        return False
+
+    def update_keys(self):
+        upper = self.shift or self.caps
+        for widget, label, action in self.key_views:
+            latched = (action == "@shift" and upper) or MODS.get(action) in self.mods
+            if latched:
+                widget.add_css_class("latched")
+            else:
+                widget.remove_css_class("latched")
+            if action == "@shift" and self.caps:
+                label = "⇪"
+            elif upper and action == label and label.isalpha():
+                label = label.upper()
+            if widget.get_label() != label:
+                widget.set_label(label)
+
+    def set_expanded(self, expanded, save=True):
+        self.state["expanded"] = expanded
+        self.keys.set_visible(expanded)
+        self.btn_small.set_visible(expanded)
+        self.btn_big.set_visible(expanded)
+        if expanded:
+            self.btn_fold.set_label("Hide")
+        else:
+            self.btn_fold.set_icon_name("input-keyboard-symbolic")
+        self.btn_fold.set_tooltip_text("Hide keyboard" if expanded else "Show keyboard")
+        if not expanded:
+            self.stop_repeat()
+            self.shift = self.caps = False
+            self.mods.clear()
+            if getattr(self, "key_views", None):
+                self.update_keys()
+        self.win.set_default_size(1, 1)   # let the surface shrink to the pill
+        GLib.timeout_add(60, lambda: (self.clamp(), False)[1])
+        if save:
+            self.save()
+
+    def toggle(self):
+        self.set_expanded(not self.state["expanded"])
+
+    def resize(self, delta):
+        self.state["unit"] = max(MIN_UNIT, min(self.size_limit, self.unit + delta))
+        self.clamp()
+        self.win.set_default_size(1, 1)
+        GLib.timeout_add(60, lambda: (self.clamp(), False)[1])
+        self.save()
+
+    # ---- moving -----------------------------------------------------------
+    def begin_drag(self, *_):
+        self.drag_origin = self.position
+
+    def on_drag(self, gesture, dx, dy):
+        # Gtk.GestureDrag reports total displacement from the beginning of
+        # the gesture. Apply it once to the starting position.
+        left, bottom = self.drag_origin
+        self.state["left"] = left + dx
+        self.state["bottom"] = bottom - dy
+        self.clamp()
+
+    def end_drag(self, gesture, dx, dy):
+        if dx or dy:
+            self.on_drag(gesture, dx, dy)
+            self.state["left"], self.state["bottom"] = self.position
+            self.save()
+
+    def clamp(self):
+        surface = self.win.get_surface()
+        monitor = self.panel if self.panel is not None and self.panel.is_valid() else None
+        if monitor is None and surface is not None:
+            monitor = self.win.get_display().get_monitor_at_surface(surface)
+        geometry = monitor.get_geometry() if monitor is not None else None
+        self.apply_size(geometry)
+        left, bottom = self.state["left"], self.state["bottom"]
+        if geometry is not None:
+            child = self.win.get_child()
+            width = child.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            height = child.measure(Gtk.Orientation.VERTICAL, width)[1]
+            left = min(left, geometry.width - width)
+            # The Noctalia tablet bar reserves 44 logical pixels at the bottom.
+            bottom = min(bottom, geometry.height - height - (44 if monitor == self.panel else 0))
+        self.position = (max(0, int(left)), max(0, int(bottom)))
+        LS.set_margin(self.win, LS.Edge.LEFT, self.position[0])
+        LS.set_margin(self.win, LS.Edge.BOTTOM, self.position[1])
+
+    def save(self):
+        directory = os.path.dirname(STATE)
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as state_file:
+            try:
+                json.dump({**self.state, "left": int(self.state["left"]),
+                           "bottom": int(self.state["bottom"])}, state_file)
+                state_file.flush()
+                os.replace(state_file.name, STATE)
+            finally:
+                if os.path.exists(state_file.name):
+                    os.unlink(state_file.name)
+
+
+def main():
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        FloatKB().run([])
+    finally:
+        if running_pid() is None:
+            try:
+                os.remove(PIDFILE)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

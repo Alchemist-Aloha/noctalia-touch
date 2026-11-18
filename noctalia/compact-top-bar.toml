@@ -1,0 +1,4 @@
+# Optional compact status bar for the tablet display.
+[bar.default.monitor."@OUTPUT@"]
+start = ["wallpaper", "workspaces"]
+end = ["tray", "notifications", "volume", "brightness", "battery", "control-center"]

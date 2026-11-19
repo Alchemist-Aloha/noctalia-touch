@@ -15,14 +15,18 @@ pub enum Command {
     Toggle,
     Expand,
     Close,
+    /// Set the keyboard accent to an RGB color, or back to the theme color.
+    Accent(Option<u32>),
 }
 
 impl Command {
-    fn wire(self) -> u8 {
+    fn wire(self) -> Vec<u8> {
         match self {
-            Self::Toggle => b't',
-            Self::Expand => b'e',
-            Self::Close => b'c',
+            Self::Toggle => b"t".to_vec(),
+            Self::Expand => b"e".to_vec(),
+            Self::Close => b"c".to_vec(),
+            Self::Accent(None) => b"a".to_vec(),
+            Self::Accent(Some(rgb)) => format!("a{:06x}", rgb & 0xff_ffff).into_bytes(),
         }
     }
     fn decode(data: &[u8]) -> Option<Self> {
@@ -30,6 +34,11 @@ impl Command {
             [b't'] => Some(Self::Toggle),
             [b'e'] => Some(Self::Expand),
             [b'c'] => Some(Self::Close),
+            [b'a'] => Some(Self::Accent(None)),
+            [b'a', hex @ ..] if hex.len() == 6 => std::str::from_utf8(hex)
+                .ok()
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .map(|rgb| Self::Accent(Some(rgb))),
             _ => None,
         }
     }
@@ -74,7 +83,7 @@ impl Instance {
             }
             let client = UnixDatagram::unbound()?;
             client.set_nonblocking(true)?;
-            match client.send_to(&[command.wire()], &path) {
+            match client.send_to(&command.wire(), &path) {
                 Ok(_) => return Ok(None),
                 Err(err) => last_error = Some(err),
             }
@@ -87,7 +96,7 @@ impl Instance {
         let socket = self.socket.try_clone()?;
         let (send, recv) = async_channel::bounded(8);
         thread::spawn(move || {
-            let mut buf = [0; 4];
+            let mut buf = [0; 16];
             loop {
                 match socket.recv(&mut buf) {
                     Ok(n) => {
@@ -126,13 +135,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let mut data = [0; 4];
+        let mut data = [0; 16];
         owner
             .socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let n = owner.socket.recv(&mut data).unwrap();
         assert_eq!(Command::decode(&data[..n]), Some(Command::Toggle));
+        for command in [Command::Accent(None), Command::Accent(Some(0x12ab9f))] {
+            assert_eq!(Command::decode(&command.wire()), Some(command));
+        }
+        assert_eq!(Command::decode(b"azzzzzz"), None);
         drop(owner);
         assert!(
             Instance::acquire(dir.path(), "keyboard", Command::Expand)

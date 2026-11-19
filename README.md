@@ -53,7 +53,8 @@ The keyboard uses a phone-style layout with three pages: letters, **?123** for n
 - Swipe up on a key, or hold it, to type the small character in its corner. For example, swipe up on **q** to type **1**.
 - Slide along the space bar to move the cursor.
 - Tap shift once for one capital letter, or twice quickly for caps lock.
-- Drag the grip to move the keyboard. The bar buttons change vibration, opacity, and key size. **Hide** shrinks it to a round button that you can tap to reopen or drag to move.
+- Drag the grip to move the keyboard; it tracks your finger from the first movement. The bar buttons change vibration, accent color, opacity, and key size. Opacity applies to the panel and the keys, so the lowest steps leave only outlined, see-through keys. **Hide** shrinks the keyboard to a Material 3 floating button that you can tap to reopen or drag to move.
+- The accent color follows the Noctalia theme's primary color by default. The color dot in the bar steps through seven preset colors and then back to the theme color. To pick any color, run `floatkb --accent '#rrggbb'`, and run `floatkb --accent theme` to go back to the theme color. The command works whether or not the keyboard is open, and the choice is saved in `~/.config/noctalia-touch/keyboard-state.json`.
 
 Keys go through a persistent virtual keyboard on `/dev/uinput` that uses your normal keyboard layout. This avoids lost keys in clients such as the Noctalia launcher, which reload the keymap each time `wtype` sends a key. Characters your layout lacks, such as **€** or **¹**, fall back to `wtype`. If `/dev/uinput` is not writable for your user, every key uses `wtype`. When a Noctalia panel opens, the keyboard moves itself above it. If your device has a force-feedback motor whose input device name contains `haptic`, keys vibrate briefly.
 

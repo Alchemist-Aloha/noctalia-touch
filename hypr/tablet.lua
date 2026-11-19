@@ -60,6 +60,9 @@ hl.layer_rule({
     match = { namespace = "^floatkb$" },
     blur = true,
     ignore_alpha = 0.1,
+    -- Margin moves must land immediately or touch coordinates (relative to the
+    -- animated surface) drift, and the dragged keyboard lags the finger.
+    no_anim = true,
 })
 
 hl.bind("SUPER + K", hl.dsp.exec_cmd(keyboard .. " --toggle"))

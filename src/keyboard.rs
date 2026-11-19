@@ -13,6 +13,7 @@ use evdev::{
     AttributeSet, BusType, Device, FFEffect, FFEffectCode, FFEffectData, FFEffectKind, FFReplay,
     FFTrigger, InputId, KeyCode, KeyEvent,
 };
+use gpui_kit::SharedString;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -33,17 +34,22 @@ pub enum Page {
     More,
 }
 
+/// Labels are shared strings so rendering a frame clones a pointer, not text.
 #[derive(Clone, Debug)]
 pub struct Key {
-    pub label: String,
+    pub label: SharedString,
+    /// Label shown while Shift or Caps Lock is active.
+    pub upper: SharedString,
     pub action: Action,
     pub width: f32,
-    pub hint: Option<(String, Action)>,
+    pub hint: Option<(SharedString, Action)>,
 }
 
-fn key(label: &str, action: Action, width: f32) -> Key {
+fn key(label: &'static str, action: Action, width: f32) -> Key {
+    let label = SharedString::new_static(label);
     Key {
-        label: label.into(),
+        upper: label.clone(),
+        label,
         action,
         width,
         hint: None,
@@ -63,11 +69,18 @@ fn char_key(ch: char) -> Key {
         .iter()
         .find_map(|(base, hints)| {
             let alt = hints.chars().nth(base.find(ch)?)?;
-            Some((alt.to_string(), Action::Char(alt)))
+            Some((alt.to_string().into(), Action::Char(alt)))
         }),
     };
+    let label = SharedString::from(ch.to_string());
+    let upper = if ch.is_ascii_lowercase() {
+        ch.to_ascii_uppercase().to_string().into()
+    } else {
+        label.clone()
+    };
     Key {
-        label: ch.to_string(),
+        label,
+        upper,
         action: Action::Char(ch),
         width: 1.0,
         hint,

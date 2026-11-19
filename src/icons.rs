@@ -1,0 +1,46 @@
+//! The few Material Symbols (Rounded, weight 400, 24 px grid) the overlays draw.
+//! Embedding them avoids shipping the full symbol catalog.
+
+use gpui_kit::{AssetSource, SharedString};
+use std::borrow::Cow;
+
+pub const KEYBOARD: &str = "icons/keyboard.svg";
+
+const ICONS: &[(&str, &str)] = &[(
+    KEYBOARD,
+    r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960"><path fill="#000" d="M160-200q-33 0-56.5-23.5T80-280v-400q0-33 23.5-56.5T160-760h640q33 0 56.5 23.5T880-680v400q0 33-23.5 56.5T800-200H160Zm0-80h640v-400H160v400Zm200-40h240q17 0 28.5-11.5T640-360q0-17-11.5-28.5T600-400H360q-17 0-28.5 11.5T320-360q0 17 11.5 28.5T360-320ZM240-440q17 0 28.5-11.5T280-480q0-17-11.5-28.5T240-520q-17 0-28.5 11.5T200-480q0 17 11.5 28.5T240-440Zm120 0q17 0 28.5-11.5T400-480q0-17-11.5-28.5T360-520q-17 0-28.5 11.5T320-480q0 17 11.5 28.5T360-440Zm120 0q17 0 28.5-11.5T520-480q0-17-11.5-28.5T480-520q-17 0-28.5 11.5T440-480q0 17 11.5 28.5T480-440Zm120 0q17 0 28.5-11.5T640-480q0-17-11.5-28.5T600-520q-17 0-28.5 11.5T560-480q0 17 11.5 28.5T600-440Zm120 0q17 0 28.5-11.5T760-480q0-17-11.5-28.5T720-520q-17 0-28.5 11.5T680-480q0 17 11.5 28.5T720-440ZM240-560q17 0 28.5-11.5T280-600q0-17-11.5-28.5T240-640q-17 0-28.5 11.5T200-600q0 17 11.5 28.5T240-560Zm120 0q17 0 28.5-11.5T400-600q0-17-11.5-28.5T360-640q-17 0-28.5 11.5T320-600q0 17 11.5 28.5T360-560Zm120 0q17 0 28.5-11.5T520-600q0-17-11.5-28.5T480-640q-17 0-28.5 11.5T440-600q0 17 11.5 28.5T480-560Zm120 0q17 0 28.5-11.5T640-600q0-17-11.5-28.5T600-640q-17 0-28.5 11.5T560-600q0 17 11.5 28.5T600-560Zm120 0q17 0 28.5-11.5T760-600q0-17-11.5-28.5T720-640q-17 0-28.5 11.5T680-600q0 17 11.5 28.5T720-560Z"/></svg>"##,
+)];
+
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        Ok(ICONS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, svg)| Cow::Borrowed(svg.as_bytes())))
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(ICONS
+            .iter()
+            .filter(|(name, _)| name.starts_with(path))
+            .map(|(name, _)| SharedString::new_static(name))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_icons_parse_as_svg() {
+        for (name, _) in ICONS {
+            let data = Assets.load(name).unwrap().unwrap();
+            usvg::Tree::from_data(&data, &usvg::Options::default())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        assert!(Assets.load("icons/missing.svg").unwrap().is_none());
+    }
+}

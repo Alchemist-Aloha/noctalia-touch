@@ -4203,6 +4203,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "usvg 0.46.0",
 ]
 
 [[package]]

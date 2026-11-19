@@ -1,6 +1,7 @@
 mod floatkb;
 mod floatwindow;
 mod hypr;
+mod icons;
 mod instance;
 mod keyboard;
 mod shell;
@@ -35,7 +36,7 @@ fn main() -> Result<()> {
         println!(
             "usage: {name}{}",
             if name == "floatkb" {
-                " [--toggle|--collapsed]"
+                " [--toggle|--collapsed|--accent <#rrggbb|theme>]"
             } else {
                 ""
             }
@@ -46,8 +47,21 @@ fn main() -> Result<()> {
         ("floatkb", []) => (Command::Expand, false),
         ("floatkb", [a]) if a == "--toggle" => (Command::Toggle, false),
         ("floatkb", [a]) if a == "--collapsed" => (Command::Expand, true),
+        ("floatkb", [a, color]) if a == "--accent" => {
+            let accent = match color.as_str() {
+                "theme" | "default" => None,
+                hex => Some(theme::parse_hex(hex).with_context(|| {
+                    format!("{name}: --accent expects #rrggbb or theme, got {hex:?}")
+                })?),
+            };
+            (Command::Accent(accent), false)
+        }
         ("floatwindow", []) => (Command::Close, false),
         _ => bail!("{name}: unknown arguments"),
+    };
+    let accent = match command {
+        Command::Accent(accent) => Some(accent),
+        _ => None,
     };
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .context("XDG_RUNTIME_DIR is not set; run in a Wayland session")?;
@@ -58,24 +72,26 @@ fn main() -> Result<()> {
     let result = Rc::new(RefCell::new(Ok(())));
     let status = result.clone();
     let keyboard = name == "floatkb";
-    gpui_kit::platform::linux(WindowingModes::WAYLAND).run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        gpui_kit_material::init(cx);
-        let setup = if keyboard {
-            floatkb::run(cx, collapsed, commands)
-        } else {
-            cx.spawn(async move |cx| {
-                if commands.recv().await.is_ok() {
-                    cx.update(|cx| cx.quit());
-                }
-            })
-            .detach();
-            floatwindow::run(cx)
-        };
-        if let Err(e) = setup {
-            *status.borrow_mut() = Err(e);
-            cx.quit();
-        }
-    });
+    gpui_kit::platform::linux(WindowingModes::WAYLAND)
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
+            gpui_kit::init(cx);
+            gpui_kit_material::init(cx);
+            let setup = if keyboard {
+                floatkb::run(cx, collapsed, accent, commands)
+            } else {
+                cx.spawn(async move |cx| {
+                    if commands.recv().await.is_ok() {
+                        cx.update(|cx| cx.quit());
+                    }
+                })
+                .detach();
+                floatwindow::run(cx)
+            };
+            if let Err(e) = setup {
+                *status.borrow_mut() = Err(e);
+                cx.quit();
+            }
+        });
     result.replace(Ok(()))
 }

@@ -52,6 +52,7 @@ main=$config/hypr/hyprland.lua
 root=$config/hypr/noctalia-touch
 bar=$config/noctalia/noctalia-touch.toml
 colors=$config/noctalia/templates/noctalia-touch-colors.css
+rotation_style=$config/noctalia/noctalia-touch-rotation.toml
 begin='-- BEGIN noctalia-touch'
 end='-- END noctalia-touch'
 
@@ -78,12 +79,16 @@ gi.require_version("Gtk4LayerShell", "1.0")
 PYTHON
 if "$rotate"; then
     command -v monitor-sensor >/dev/null || fail "install iio-sensor-proxy for autorotation"
+    command -v jq >/dev/null || fail "install jq for autorotation"
 fi
 
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
+rotation_member=""
+"$rotate" && rotation_member=', "noctalia_touch_rotation"'
 render() {
     sed -e "s/@OUTPUT@/$output/g" -e "s/@SCALE@/$scale/g" \
+        -e "s/@ROTATION_MEMBER@/$rotation_member/g" \
         -e "s/@SWIPES@/$swipes/g" -e "s/@AUTOROTATE@/$rotate/g" \
         -e "s/@SOFTWARE_CURSOR@/$software_cursor/g" \
         -e "s/@START_NOCTALIA@/$start_noctalia/g" "$1"
@@ -91,6 +96,10 @@ render() {
 
 render "$src/hypr/tablet.lua" > "$stage/tablet.lua"
 render "$src/noctalia/tablet.toml" > "$stage/noctalia-touch.toml"
+if "$rotate"; then
+    printf '\n' >> "$stage/noctalia-touch.toml"
+    render "$src/noctalia/rotation-button.toml" >> "$stage/noctalia-touch.toml"
+fi
 if "$compact"; then
     printf '\n' >> "$stage/noctalia-touch.toml"
     render "$src/noctalia/compact-top-bar.toml" >> "$stage/noctalia-touch.toml"
@@ -113,7 +122,7 @@ mkdir -p -- "$state/noctalia-touch/backups"
 backup=$(mktemp -d "$state/noctalia-touch/backups/install.XXXXXXXX")
 chmod 700 "$backup"
 cp -L -- "$main" "$backup/hyprland.lua"
-for path in "$root" "$bar" "$colors"; do
+for path in "$root" "$bar" "$colors" "$rotation_style"; do
     if [[ -e $path || -L $path ]]; then
         cp -a -- "$path" "$backup/"
     fi
@@ -129,6 +138,8 @@ if "$swipes"; then
 fi
 install -m 644 "$src/noctalia/floatwindow-colors.css" "$colors"
 install -m 644 "$stage/noctalia-touch.toml" "$bar"
+# bin/autorotate writes the rotation button's style when it starts.
+"$rotate" || rm -f -- "$rotation_style"
 if ! grep -Fxq -- "$begin" "$main"; then
     cat >> "$main" <<'LUA'
 

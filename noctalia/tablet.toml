@@ -2,15 +2,31 @@
 enabled = false
 position = "bottom"
 reserve_space = true
-thickness = 44
+thickness = 56
+scale = 1.3
 margin_ends = 0
 radius = 0
 concave_edge_corners = false
 padding = 8
+widget_spacing = 12
+# Every control: icon-only (sized by the bar scale), tooltip, inside a surface_container capsule.
+start = ["group:system"]
+center = ["group:windows", "group:columns", "group:window_size"]
+end = ["group:close"]
+
+[[bar.noctalia_touch.capsule_group]]
+id = "system"
+members = ["noctalia_touch_launcher", "noctalia_touch_keyboard"@ROTATION_MEMBER@]
+fill = "surface_container"
+padding = 8
 widget_spacing = 20
-start = ["noctalia_touch_launcher", "noctalia_touch_keyboard"]
-center = ["noctalia_touch_windows", "group:columns", "group:window_size", "noctalia_touch_floatwindow"]
-end = ["noctalia_touch_close"]
+
+[[bar.noctalia_touch.capsule_group]]
+id = "windows"
+members = ["noctalia_touch_windows", "noctalia_touch_floatwindow"]
+fill = "surface_container"
+padding = 8
+widget_spacing = 20
 
 [[bar.noctalia_touch.capsule_group]]
 id = "columns"
@@ -26,6 +42,13 @@ fill = "surface_container"
 padding = 8
 widget_spacing = 20
 
+[[bar.noctalia_touch.capsule_group]]
+id = "close"
+members = ["noctalia_touch_close"]
+fill = "surface_container"
+padding = 8
+widget_spacing = 20
+
 [bar.noctalia_touch.monitor."@OUTPUT@"]
 enabled = true
 
@@ -36,27 +59,35 @@ mru = true
 [widget.noctalia_touch_launcher]
 type = "custom_button"
 glyph = "search"
-label = "Apps"
 tooltip = "Open the app launcher"
 actions.left = "panel-toggle launcher"
 
+[widget.noctalia_touch_keyboard]
+type = "custom_button"
+glyph = "keyboard"
+tooltip = "Toggle the on-screen keyboard"
+actions.left = """exec sh -c 'exec "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/noctalia-touch/bin/floatkb" --toggle'"""
+
 [widget.noctalia_touch_windows]
 type = "custom_button"
-glyph = "apps"
-label = "Windows"
+glyph = "layout-grid"
 tooltip = "Show open windows"
 actions.left = "window-switcher all"
 
+[widget.noctalia_touch_floatwindow]
+type = "custom_button"
+glyph = "picture-in-picture"
+tooltip = "Float, tile, move, or resize the focused window"
+actions.left = """exec sh -c 'exec "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/noctalia-touch/bin/floatwindow"'"""
+
 [widget.noctalia_touch_previous]
 type = "custom_button"
-scale = 1.35
 glyph = "chevron-left"
 tooltip = "Focus the column to the left"
 actions.left = """exec hyprctl dispatch 'hl.dsp.layout("focus l")'"""
 
 [widget.noctalia_touch_next]
 type = "custom_button"
-scale = 1.35
 glyph = "chevron-right"
 tooltip = "Focus the column to the right"
 actions.left = """exec hyprctl dispatch 'hl.dsp.layout("focus r")'"""
@@ -64,37 +95,20 @@ actions.left = """exec hyprctl dispatch 'hl.dsp.layout("focus r")'"""
 [widget.noctalia_touch_width]
 type = "custom_button"
 glyph = "columns-2"
-label = "Width"
 tooltip = "Cycle column width"
 actions.left = """exec hyprctl dispatch 'hl.dsp.layout("colresize +conf")'"""
 
 [widget.noctalia_touch_maximize]
 type = "custom_button"
-scale = 1.35
 glyph = "maximize"
 tooltip = "Maximize or restore the focused window"
 actions.left = """exec hyprctl dispatch 'hl.dsp.window.fullscreen({mode = "maximized", layout_aware = false})'"""
 
-[widget.noctalia_touch_keyboard]
-type = "custom_button"
-scale = 1.35
-glyph = "keyboard"
-tooltip = "Toggle the on-screen keyboard"
-actions.left = """exec sh -c 'exec "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/noctalia-touch/bin/floatkb" --toggle'"""
-
 [widget.noctalia_touch_close]
 type = "custom_button"
 glyph = "x"
-label = "Close"
 tooltip = "Close the focused window"
 actions.left = "exec hyprctl dispatch 'hl.dsp.window.close()'"
-
-[widget.noctalia_touch_floatwindow]
-type = "custom_button"
-glyph = "apps"
-label = "Float"
-tooltip = "Float, tile, move, or resize the focused window"
-actions.left = """exec sh -c 'exec "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/noctalia-touch/bin/floatwindow"'"""
 
 [theme.templates.user.noctalia_touch]
 input_path = "$XDG_CONFIG_HOME/noctalia/templates/noctalia-touch-colors.css"

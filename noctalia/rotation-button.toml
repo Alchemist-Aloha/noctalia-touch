@@ -1,0 +1,5 @@
+# Added with --autorotate. The glyph, highlight and tooltip come from
+# noctalia-touch-rotation.toml, which bin/autorotate rewrites on every toggle.
+[widget.noctalia_touch_rotation]
+type = "custom_button"
+actions.left = """exec sh -c 'exec "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/noctalia-touch/bin/autorotate" --toggle-lock'"""

@@ -2,18 +2,30 @@
 """floatkb - a floating, draggable on-screen keyboard for Hyprland.
 
 It is a layer-shell overlay that never takes keyboard focus, so taps go to
-whatever app was focused. Keystrokes are sent with `wtype`.
+whatever app was focused. Keystrokes go through a persistent uinput keyboard
+(US layout), so apps never see a keymap change mid-typing; characters the US
+layout lacks (e.g. €, ¹) fall back to `wtype`.
 
   floatkb            start (or expand it if already running)
   floatkb --toggle   expand / collapse the running keyboard
 
-Drag the handle to move it. Minus and plus resize it. Hide collapses
-it to a pill. Position and preferred size are saved.
+Phone-style layout with three pages: letters, ?123 (numbers and common
+symbols) and =\\< (brackets, more symbols, Home/End/PgUp/PgDn/Del). A short
+row above every page holds Esc, Tab, Ctrl, Alt, Super and the arrow keys.
+  - Swipe up on a key (or hold it) to type the small character in its corner,
+    e.g. swipe up on q for 1. On "," that is Tab, on "." it is Esc.
+  - Slide along the space bar to move the cursor.
+  - Tap shift once for one capital, twice quickly for caps lock.
+Drag the handle to move it. The bar buttons change key size, opacity and
+haptics, and Hide collapses it to a pill. All of that is saved.
 """
+import fcntl
 import json
 import os
 import queue
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -64,48 +76,82 @@ except (ImportError, ValueError):
 
 # ---- layouts --------------------------------------------------------------
 # A key is either a 1-char string (typed as-is) or (label, action, width).
-# Actions starting with "@" are specials; "@<Keysym>" sends that keysym.
-ARROWS = [("←", "@Left", 1), ("↓", "@Down", 1), ("↑", "@Up", 1), ("→", "@Right", 1)]
-BOTTOM = lambda switch: [(switch, "@sym", 1.5), ("Ctrl", "@ctrl", 1), ("Alt", "@alt", 1),
-                         ("Space", "@space", 4)] + ARROWS
+# Actions starting with "@" are specials: "@shift", "@ctrl", "@alt",
+# "@space", "@mode:<page>", or "@<Keysym>" which sends that keysym.
+# Shown above every page. Ctrl, Alt and Super latch until the next key.
+STRIP = [("Esc", "@Escape", 1), ("⇥", "@Tab", 1.25), ("Ctrl", "@ctrl", 1.25),
+         ("Alt", "@alt", 1.25), ("❖", "@super", 1.25), ("←", "@Left", 1), ("↓", "@Down", 1),
+         ("↑", "@Up", 1), ("→", "@Right", 1)]
+STRIP_HEIGHT = 0.8       # in key heights
+BOTTOM = lambda page, label: [(label, "@mode:" + page, 1.5), ",", ("space", "@space", 5),
+                              ".", ("⏎", "@Return", 1.5)]
+PAGES = {
+    "abc": [
+        list("qwertyuiop"),
+        list("asdfghjkl"),
+        [("⇧", "@shift", 1.5)] + list("zxcvbnm") + [("⌫", "@BackSpace", 1.5)],
+        BOTTOM("sym", "?123"),
+    ],
+    "sym": [
+        list("1234567890"),
+        list("@#$_&-+()/"),
+        [("=\\<", "@mode:more", 1.5)] + list("*\"':;!?") + [("⌫", "@BackSpace", 1.5)],
+        BOTTOM("abc", "abc"),
+    ],
+    "more": [
+        list("~`|\\{}[]<>"),
+        list("^%=€£¥°•§¶"),
+        [("?123", "@mode:sym", 1.5), ("Home", "@Home", 1.25), ("End", "@End", 1.25),
+         ("PgUp", "@Prior", 1.25), ("PgDn", "@Next", 1.25), ("Del", "@Delete", 1.25),
+         ("⌫", "@BackSpace", 1.5)],
+        BOTTOM("abc", "abc"),
+    ],
+}
+# Swipe up (or hold) on a key types its hint: (corner label, action).
+HINTS = {c: (n, n) for c, n in zip("qwertyuiop", "1234567890")}
+HINTS.update({c: (s, s) for c, s in zip("asdfghjkl", "@#$_&-+()")})
+HINTS.update({c: (s, s) for c, s in zip("zxcvbnm", "*\"':;!?")})
+HINTS.update({",": ("⇥", "@Tab"), ".": ("esc", "@Escape")})
+HINTS.update({c: (s, s) for c, s in zip("1234567890", "¹²³¼½¾⅛°±≠")})
 
-LETTERS = [
-    list("qwertyuiop") + [("⌫", "@BackSpace", 1.5)],
-    [("⇥", "@Tab", 1)] + list("asdfghjkl") + [("⏎", "@Return", 1.5)],
-    [("⇧", "@shift", 1.5)] + list("zxcvbnm,.") + [("⇧", "@shift", 1)],
-    BOTTOM("?123"),
-]
-SYMBOLS = [
-    list("1234567890") + [("⌫", "@BackSpace", 1.5)],
-    list("!@#$%^&*()") + [("⏎", "@Return", 1.5)],
-    [("Esc", "@Escape", 1.5)] + list("-_=+[]{}\\|"),
-    [("⇥", "@Tab", 1.5)] + list(";:'\"/?<>`~"),
-    BOTTOM("abc"),
-]
-REPEAT = {"@BackSpace", "@Left", "@Right", "@Up", "@Down", "@space"}
-MODS = {"@ctrl": "ctrl", "@alt": "alt"}
+REPEAT = {"@BackSpace", "@Delete", "@Left", "@Right", "@Up", "@Down"}
+MODS = {"@ctrl": "ctrl", "@alt": "alt", "@super": "logo"}
 GAP = 5
 PADDING = 8
 MIN_UNIT = 28
 MAX_UNIT = 72
 MAX_ROW = max(sum(1 if isinstance(key, str) else key[2] for key in row)
-              for row in LETTERS + SYMBOLS)
+              for page in PAGES.values() for row in page + [STRIP])
 REPEAT_DELAY = 400
 REPEAT_INTERVAL = 65
+HOLD_MS = 380            # hold this long to type the hint instead
+SWIPE = 0.4              # swipe up this many key heights to type the hint
+CURSOR_STEP = 0.45       # space-bar slide: key widths per cursor step
+OPACITY = (0.25, 0.45, 0.7, 0.92)
 
 CSS = """
-.kb      {{ background: #1b1d25; border-radius: 14px; padding: {padding}px;
-            border: 1px solid #444858; }}
-.grip    {{ background: #71778a; border-radius: 3px; min-width: 44px; min-height: 5px; }}
-.barbtn  {{ color: #e3e6f1; font-size: {gf}px; border-radius: 8px;
-            background: #303442; min-height: 36px; min-width: 34px; padding: 0 9px; }}
-.barbtn:active {{ background: #acc6ff; color: #141e34; }}
-.barbtn:disabled {{ color: #9298a9; background: #252833; }}
-.key     {{ background: #333747; color: #f4f5fb; border-radius: 8px;
-            font-size: {fs}px; }}
-.key.mod {{ background: #282c39; font-size: {ms}px; }}
-.key.primary {{ background: #40547c; }}
-.key.latched, .key.pressed {{ background: #acc6ff; color: #141e34; }}
+.floatkb-win {{ background: transparent; }}
+.kb      {{ background: rgba(22, 24, 32, {bg}); border-radius: 16px; padding: {padding}px;
+            border: 1px solid rgba(255, 255, 255, 0.12); }}
+.kb.collapsed {{ padding: 3px; border-radius: 999px; }}
+.barbtn.pill {{ border-radius: 999px; min-width: {pill}px; min-height: {pill}px; padding: 0; }}
+.grip    {{ background: rgba(230, 233, 245, 0.55); border-radius: 3px; min-width: 44px;
+            min-height: 5px; }}
+.barbtn  {{ color: #eef0f8; font-size: {gf}px; border-radius: 9px; border: none;
+            background: rgba(255, 255, 255, {btn}); min-height: 36px; min-width: 34px;
+            padding: 0 9px; box-shadow: none; }}
+.barbtn:active {{ background: rgba(172, 198, 255, 0.9); color: #141e34; }}
+.barbtn:disabled {{ color: rgba(238, 240, 248, 0.4); }}
+.barbtn.off {{ color: rgba(238, 240, 248, 0.45); }}
+.key     {{ background: rgba(255, 255, 255, {key}); color: #f6f7fc; border-radius: 9px;
+            font-size: {fs}px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55); }}
+.key.mod {{ background: rgba(255, 255, 255, {mod}); font-size: {ms}px; }}
+.key.primary {{ background: rgba(118, 150, 222, {primary}); }}
+.key.latched, .key.pressed {{ background: rgba(172, 198, 255, 0.92); color: #141e34;
+            text-shadow: none; }}
+.key.alt {{ background: rgba(118, 150, 222, 0.95); color: #ffffff; }}
+.hint    {{ font-size: {hs}px; color: rgba(246, 247, 252, 0.62); margin: 2px 5px; }}
+.key.pressed .hint, .key.alt .hint {{ color: transparent; }}
 """
 
 
@@ -113,21 +159,137 @@ def keysym_for(ch):
     return Gdk.keyval_name(Gdk.unicode_to_keyval(ord(ch)))
 
 
+class Haptics:
+    """Short taps on a force-feedback (vibration) motor named "*haptic*", if present."""
+    EVIOCSFF = 0x40304580          # _IOW('E', 0x80, struct ff_effect), 48 bytes on 64-bit
+    EV_FF, FF_RUMBLE, FF_GAIN = 0x15, 0x50, 0x60
+
+    def __init__(self, ms=14, strength=0xB000):
+        self.fd, self.effect = None, None
+        for name in sorted(os.listdir("/sys/class/input")):
+            if not name.startswith("event"):
+                continue
+            try:
+                with open(f"/sys/class/input/{name}/device/name") as f:
+                    if "haptic" not in f.read().lower():
+                        continue
+                fd = os.open(f"/dev/input/{name}", os.O_RDWR | os.O_NONBLOCK)
+            except OSError:
+                continue
+            try:
+                # The gain defaults to 0 on this driver, which plays effects silently.
+                self.write(fd, self.FF_GAIN, 0xFFFF)
+                head = struct.pack("=HhHHHHH", self.FF_RUMBLE, -1, 0, 0, 0, ms, 0)
+                buf = bytearray(head + b"\0" * (16 - len(head))
+                                + struct.pack("=HH", strength, strength) + b"\0" * 28)
+                fcntl.ioctl(fd, self.EVIOCSFF, buf, True)
+                self.fd, self.effect = fd, struct.unpack_from("=h", buf, 2)[0]
+                return
+            except OSError:
+                os.close(fd)
+
+    @staticmethod
+    def write(fd, code, value):
+        os.write(fd, struct.pack("=qqHHi", 0, 0, Haptics.EV_FF, code, value))
+
+    @property
+    def available(self):
+        return self.fd is not None
+
+    def tap(self):
+        if self.fd is not None:
+            try:
+                self.write(self.fd, self.effect, 1)
+            except OSError:
+                pass
+
+
+class Uinput:
+    """A persistent kernel virtual keyboard. Unlike wtype, which uploads a new keymap
+    for every call, it uses the compositor's normal layout, so clients such as the
+    Noctalia launcher never drop keys while reloading a keymap."""
+    UI_SET_EVBIT, UI_SET_KEYBIT, UI_DEV_CREATE, UI_DEV_DESTROY = 0x40045564, 0x40045565, 0x5501, 0x5502
+    EV_SYN, EV_KEY = 0x00, 0x01
+    MODS = {"shift": 42, "ctrl": 29, "alt": 56, "logo": 125}
+    SPECIAL = {"Escape": 1, "BackSpace": 14, "Tab": 15, "Return": 28, "space": 57, "Home": 102,
+               "Up": 103, "Prior": 104, "Left": 105, "Right": 106, "End": 107, "Down": 108,
+               "Next": 109, "Delete": 111}
+    # US layout: character -> (keycode, needs shift)
+    CHARS = {}
+    for row, codes in (("1234567890", range(2, 12)), ("qwertyuiop", range(16, 26)),
+                       ("asdfghjkl", range(30, 39)), ("zxcvbnm", range(44, 51))):
+        for ch, code in zip(row, codes):
+            CHARS[ch] = (code, False)
+            if ch.isalpha():
+                CHARS[ch.upper()] = (code, True)
+    for ch, shifted, code in zip("-=[]\\;',./`", "_+{}|:\"<>?~", (12, 13, 26, 27, 43, 39, 40, 51, 52, 53, 41)):
+        CHARS[ch], CHARS[shifted] = (code, False), (code, True)
+    for ch, code in zip("!@#$%^&*()", range(2, 12)):
+        CHARS[ch] = (code, True)
+    CHARS[" "] = (57, False)
+
+    def __init__(self):
+        self.fd = None
+        try:
+            fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            fcntl.ioctl(fd, self.UI_SET_EVBIT, self.EV_KEY)
+            fcntl.ioctl(fd, self.UI_SET_EVBIT, self.EV_SYN)
+            codes = {c for c, _ in self.CHARS.values()} | set(self.SPECIAL.values()) | set(self.MODS.values())
+            for code in codes:
+                fcntl.ioctl(fd, self.UI_SET_KEYBIT, code)
+            # struct uinput_user_dev: name[80], input_id (4 x u16), ff_effects_max, 4 x abs[64]
+            dev = b"floatkb virtual keyboard".ljust(80, b"\0")
+            dev += struct.pack("=HHHHI", 0x06, 0x1, 0x1, 1, 0) + b"\0" * (4 * 64 * 4)
+            os.write(fd, dev)
+            fcntl.ioctl(fd, self.UI_DEV_CREATE)
+            self.fd = fd
+        except OSError:
+            os.close(fd)
+
+    def lookup(self, keysym):
+        """Keycode and needed shift for a keysym name, or None if the US layout lacks it."""
+        if keysym in self.SPECIAL:
+            return self.SPECIAL[keysym], False
+        ch = chr(Gdk.keyval_to_unicode(Gdk.keyval_from_name(keysym)) or 0)
+        return self.CHARS.get(ch)
+
+    def emit(self, code, value):
+        os.write(self.fd, struct.pack("=qqHHi", 0, 0, self.EV_KEY, code, value)
+                 + struct.pack("=qqHHi", 0, 0, self.EV_SYN, 0, 0))
+
+    def tap(self, code, modifiers):
+        held = [self.MODS[m] for m in modifiers]
+        for m in held:
+            self.emit(m, 1)
+        self.emit(code, 1)
+        time.sleep(0.004)
+        self.emit(code, 0)
+        for m in reversed(held):
+            self.emit(m, 0)
+        time.sleep(0.004)   # keep separate taps in separate input frames
+
+
 class FloatKB(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=None, flags=0)
-        self.state = {"left": 40, "bottom": 40, "unit": 44, "expanded": "--collapsed" not in sys.argv}
+        self.state = {"left": 40, "bottom": 40, "unit": 44, "opacity": 1, "haptics": True,
+                      "expanded": "--collapsed" not in sys.argv}
         try:
             with open(STATE) as state_file:
                 saved = json.load(state_file)
-            for key in ("left", "bottom", "unit"):
+            for key in ("left", "bottom", "unit", "opacity"):
                 if type(saved.get(key)) is int:
                     self.state[key] = max(0, saved[key])
-            if type(saved.get("expanded")) is bool:
-                self.state["expanded"] = saved["expanded"]
+            for key in ("expanded", "haptics"):
+                if type(saved.get(key)) is bool:
+                    self.state[key] = saved[key]
         except (AttributeError, OSError, ValueError):
             pass
         self.state["unit"] = min(MAX_UNIT, max(MIN_UNIT, self.state["unit"]))
+        self.state["opacity"] = min(len(OPACITY) - 1, self.state["opacity"])
         self.unit = self.state["unit"]
         self.position = (0, 0)
         if "--collapsed" in sys.argv:
@@ -136,6 +298,9 @@ class FloatKB(Gtk.Application):
         self.mods = set()
         self.rep = None
         self.repeat_owner = None
+        self.touches = {}
+        self.haptics = Haptics()
+        self.uinput = Uinput()
         self.q = queue.Queue()
         self.warned = False
         threading.Thread(target=self.worker, daemon=True).start()
@@ -143,7 +308,21 @@ class FloatKB(Gtk.Application):
     # ---- typing ---------------------------------------------------------
     def worker(self):
         while True:
-            args = self.q.get()
+            keysym, modifiers = self.q.get()
+            hit = self.uinput.lookup(keysym) if self.uinput.fd is not None else None
+            if hit is not None:
+                code, shifted = hit
+                try:
+                    self.uinput.tap(code, sorted(set(modifiers) | ({"shift"} if shifted else set())))
+                    continue
+                except OSError:
+                    pass
+            args = ["wtype"]
+            for m in modifiers:
+                args += ["-M", m]
+            args += ["-k", keysym]
+            for m in reversed(modifiers):
+                args += ["-m", m]
             try:
                 subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
             except FileNotFoundError:
@@ -159,14 +338,11 @@ class FloatKB(Gtk.Application):
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def send(self, keysym, shift=False):
-        args = ["wtype"]
-        modifiers = sorted(self.mods | ({"shift"} if shift else set()))
-        for m in modifiers:
-            args += ["-M", m]
-        args += ["-k", keysym]
-        for m in reversed(modifiers):
-            args += ["-m", m]
-        self.q.put(args)
+        self.q.put((keysym, sorted(self.mods | ({"shift"} if shift else set()))))
+
+    def buzz(self):
+        if self.state["haptics"]:
+            self.haptics.tap()
 
     # ---- key handling ----------------------------------------------------
     def act(self, action):
@@ -181,9 +357,8 @@ class FloatKB(Gtk.Application):
             self.last_shift = now
             self.update_keys()
             return
-        if action == "@sym":
-            self.mode = "sym" if self.mode == "abc" else "abc"
-            GLib.idle_add(self.build_keys)
+        if action.startswith("@mode:"):
+            self.set_mode(action[6:])
             return
         if action in MODS:
             self.mods ^= {MODS[action]}
@@ -201,30 +376,125 @@ class FloatKB(Gtk.Application):
             self.shift = False
         self.update_keys()
 
-    def on_press(self, widget, action):
+    def set_mode(self, mode):
+        self.mode = mode
+        GLib.idle_add(self.build_keys)
+
+    def deferred(self, action):
+        """Typed on release, so a swipe or hold can pick the hint instead."""
+        return not action.startswith("@") or action == "@space"
+
+    def on_begin(self, gesture, x, y, view):
+        widget, main, label, action, hint = view
         widget.add_css_class("pressed")
-        self.stop_repeat()
-        self.act(action)
-        if action in REPEAT:
-            self.repeat_owner = widget
+        self.buzz()
+        touch = self.touches[widget] = {"alt": False, "held": False, "steps": 0, "sliding": False,
+                                         "hold": None}
+        if not self.deferred(action):
+            self.stop_repeat()
+            self.act(action)
+            if action in REPEAT:
+                self.start_repeat(widget, action)
+            return
+        if hint is not None:
+            touch["hold"] = GLib.timeout_add(HOLD_MS, self.hold_fired, view)
 
-            def repeat():
-                # Leave room for fresh taps if the compositor is slow.
-                if self.q.empty():
-                    self.act(action)
-                return True
+    def hold_fired(self, view):
+        touch = self.touches.get(view[0])
+        if touch is not None:
+            touch["hold"] = None
+            touch["held"] = True
+            self.set_alt(view, True)
+            self.buzz()
+        return False
 
-            def start():
-                repeat()
-                self.rep = GLib.timeout_add(REPEAT_INTERVAL, repeat)
-                return False
+    def on_update(self, gesture, dx, dy, view):
+        widget, main, label, action, hint = view
+        touch = self.touches.get(widget)
+        if touch is None:
+            return
+        if action == "@space":
+            steps = int(dx / (self.unit * CURSOR_STEP))
+            if steps != touch["steps"] or touch["sliding"]:
+                if not touch["sliding"] and steps:
+                    touch["sliding"] = True
+                    widget.add_css_class("alt")
+                while touch["steps"] < steps:
+                    touch["steps"] += 1
+                    self.send("Right")
+                    self.buzz()
+                while touch["steps"] > steps:
+                    touch["steps"] -= 1
+                    self.send("Left")
+                    self.buzz()
+            return
+        if hint is None or touch["held"]:
+            return          # a completed hold stays on the hint until release
+        up = -dy >= self.unit * SWIPE
+        if up and touch["hold"] is not None:
+            GLib.source_remove(touch["hold"])
+            touch["hold"] = None
+        if up != touch["alt"]:
+            self.set_alt(view, up)   # swiping back down cancels the swipe
+            if up:
+                self.buzz()
 
-            self.rep = GLib.timeout_add(REPEAT_DELAY, start)
+    def set_alt(self, view, on):
+        widget, main, label, action, hint = view
+        touch = self.touches.get(widget)
+        if touch is None:
+            return
+        touch["alt"] = on
+        if on:
+            widget.add_css_class("alt")
+            main.set_label(hint[0])
+        else:
+            widget.remove_css_class("alt")
+            self.update_keys()
 
-    def on_release(self, widget):
+    def on_end(self, gesture, dx, dy, view):
+        widget, main, label, action, hint = view
+        touch = self.touches.pop(widget, None)
         widget.remove_css_class("pressed")
+        widget.remove_css_class("alt")
         if self.repeat_owner is widget:
             self.stop_repeat()
+        if touch is None:
+            return
+        if touch["hold"] is not None:
+            GLib.source_remove(touch["hold"])
+        if self.deferred(action):
+            if touch["alt"]:
+                self.act(hint[1])
+            elif not touch["sliding"]:
+                self.act(action)
+        self.update_keys()
+
+    def on_cancel(self, gesture, sequence, view):
+        touch = self.touches.pop(view[0], None)
+        if touch is not None and touch["hold"] is not None:
+            GLib.source_remove(touch["hold"])
+        view[0].remove_css_class("pressed")
+        view[0].remove_css_class("alt")
+        if self.repeat_owner is view[0]:
+            self.stop_repeat()
+        self.update_keys()
+
+    def start_repeat(self, widget, action):
+        self.repeat_owner = widget
+
+        def repeat():
+            # Leave room for fresh taps if the compositor is slow.
+            if self.q.empty():
+                self.act(action)
+            return True
+
+        def start():
+            repeat()
+            self.rep = GLib.timeout_add(REPEAT_INTERVAL, repeat)
+            return False
+
+        self.rep = GLib.timeout_add(REPEAT_DELAY, start)
 
     def stop_repeat(self):
         if self.rep is not None:
@@ -232,17 +502,20 @@ class FloatKB(Gtk.Application):
             self.rep = None
         self.repeat_owner = None
 
-    def tappable(self, widget, action):
-        gesture = Gtk.GestureClick()
+    def bind(self, view):
+        # One drag gesture per key, so fast overlapping taps on different keys all register.
+        gesture = Gtk.GestureDrag()
         gesture.set_button(1)
-        gesture.connect("pressed", lambda *_: self.on_press(widget, action))
-        for event in ("released", "cancel", "unpaired-release"):
-            gesture.connect(event, lambda *_: self.on_release(widget))
-        widget.add_controller(gesture)
+        gesture.connect("drag-begin", self.on_begin, view)
+        gesture.connect("drag-update", self.on_update, view)
+        gesture.connect("drag-end", self.on_end, view)
+        gesture.connect("cancel", self.on_cancel, view)
+        view[0].add_controller(gesture)
 
     # ---- UI ---------------------------------------------------------------
     def do_activate(self):
         win = self.win = Gtk.Window(application=self)
+        win.add_css_class("floatkb-win")
         LS.init_for_window(win)
         LS.set_namespace(win, "floatkb")
         LS.set_layer(win, LS.Layer.OVERLAY)
@@ -259,12 +532,12 @@ class FloatKB(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=GAP)
+        root = self.root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=GAP)
         root.add_css_class("kb")
         win.set_child(root)
 
         bar = Gtk.Box(spacing=6)
-        grip = Gtk.Box(hexpand=True, width_request=68, height_request=40)
+        grip = self.grip = Gtk.Box(hexpand=True, width_request=68, height_request=40)
         grip.set_cursor_from_name("grab")
         grip.set_tooltip_text("Drag to move the keyboard")
         handle = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, hexpand=True)
@@ -277,10 +550,21 @@ class FloatKB(Gtk.Application):
         grip.add_controller(drag)
         bar.append(grip)
 
+        self.btn_haptic = self.bar_button("〰", "Toggle key vibration", self.toggle_haptics)
+        self.btn_haptic.set_visible(self.haptics.available)
+        self.btn_opacity = self.bar_button("◐", "Change keyboard opacity", self.cycle_opacity)
         self.btn_small = self.bar_button("−", "Smaller keys", lambda: self.resize(-4))
         self.btn_big = self.bar_button("+", "Larger keys", lambda: self.resize(+4))
-        self.btn_fold = self.bar_button("Hide", "Hide keyboard", self.toggle)
-        for b in (self.btn_small, self.btn_big, self.btn_fold):
+        self.btn_fold = self.bar_button("Hide", "Hide keyboard", self.fold_clicked)
+        # Collapsed, the keyboard is just this round button: tap to open, drag to move.
+        self.dragged = False
+        fold_drag = Gtk.GestureDrag()
+        fold_drag.connect("drag-begin", self.begin_drag)
+        fold_drag.connect("drag-update", self.fold_drag)
+        fold_drag.connect("drag-end", self.fold_drag_end)
+        self.btn_fold.add_controller(fold_drag)
+        self.expanded_only = (self.btn_haptic, self.btn_opacity, self.btn_small, self.btn_big)
+        for b in self.expanded_only + (self.btn_fold,):
             bar.append(b)
         root.append(bar)
 
@@ -291,10 +575,44 @@ class FloatKB(Gtk.Application):
         signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda: (self.set_expanded(True), True)[1])
         signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (self.quit(), False)[1])
         GLib.timeout_add(1000, lambda: (self.clamp(), True)[1])   # keep on-screen after rotation
+        threading.Thread(target=self.watch_layers, daemon=True).start()
 
+        self.update_haptic_button()
         self.set_expanded(self.state["expanded"], save=False)
         self.clamp()
         win.present()
+
+    def watch_layers(self):
+        """Stay usable over Noctalia panels such as the app launcher.
+
+        Layer surfaces on the same layer stack in mapping order, so a panel opened
+        after the keyboard covers it. When one opens, remap the keyboard on top.
+        """
+        path = os.path.join(RUN, "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
+                            ".socket2.sock")
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX) as sock:
+                    sock.connect(path)
+                    buf = b""
+                    while chunk := sock.recv(4096):
+                        buf += chunk
+                        *lines, buf = buf.split(b"\n")
+                        for line in lines:
+                            if line == b"openlayer>>noctalia-panel":
+                                GLib.timeout_add(30, self.raise_to_top)
+            except OSError:
+                pass
+            time.sleep(2)   # Hyprland restarting or not ready yet
+
+    def raise_to_top(self):
+        if self.win.get_visible():
+            self.stop_repeat()
+            self.touches.clear()
+            self.win.set_visible(False)
+            self.win.set_visible(True)
+            self.clamp()
+        return False
 
     def bar_button(self, text, tooltip, callback):
         button = Gtk.Button(label=text, focusable=False)
@@ -303,12 +621,57 @@ class FloatKB(Gtk.Application):
         button.connect("clicked", lambda *_: callback())
         return button
 
+    def fold_drag(self, gesture, dx, dy):
+        if self.state["expanded"]:
+            return
+        if abs(dx) + abs(dy) > 8:
+            self.dragged = True
+        if self.dragged:
+            self.on_drag(gesture, dx, dy)
+
+    def fold_drag_end(self, gesture, dx, dy):
+        if self.dragged and not self.state["expanded"]:
+            self.on_drag(gesture, dx, dy)
+            self.state["left"], self.state["bottom"] = self.position
+            self.save()
+
+    def fold_clicked(self):
+        if self.dragged:
+            self.dragged = False   # that press was a move, not a tap
+            return
+        self.toggle()
+
+    def toggle_haptics(self):
+        self.state["haptics"] = not self.state["haptics"]
+        self.update_haptic_button()
+        self.buzz()
+        self.save()
+
+    def update_haptic_button(self):
+        if self.state["haptics"]:
+            self.btn_haptic.remove_css_class("off")
+        else:
+            self.btn_haptic.add_css_class("off")
+
+    def cycle_opacity(self):
+        self.state["opacity"] = (self.state["opacity"] + 1) % len(OPACITY)
+        self.load_css()
+        self.save()
+
+    def load_css(self):
+        unit, a = self.unit, OPACITY[self.state["opacity"]]
+        self.css.load_from_string(CSS.format(
+            fs=int(unit * 0.46), ms=int(unit * 0.33), hs=max(9, int(unit * 0.24)),
+            gf=max(14, int(unit * 0.32)), padding=PADDING, pill=40,
+            bg=round(a, 2), key=round(0.08 + 0.22 * a, 2), mod=round(0.04 + 0.12 * a, 2),
+            primary=round(0.35 + 0.5 * a, 2), btn=round(0.06 + 0.16 * a, 2)))
+
     def apply_size(self, geometry):
         limit = MAX_UNIT
         if geometry is not None:
-            # Both layers use the same size, so switching symbols never shifts the keyboard.
+            # All pages use the same size, so switching pages never shifts the keyboard.
             limit = min(limit, int((geometry.width - 2 * PADDING - 2 + GAP) / MAX_ROW) - GAP,
-                        int((geometry.height - 140) / 5.25))
+                        int((geometry.height - 140) / 5.5))
         self.size_limit = max(MIN_UNIT, limit)
         unit = min(self.size_limit, self.state["unit"])
         self.btn_small.set_sensitive(unit > MIN_UNIT)
@@ -316,28 +679,37 @@ class FloatKB(Gtk.Application):
         if getattr(self, "key_views", None) and self.unit == unit:
             return
         self.unit = unit
-        self.css.load_from_string(CSS.format(fs=int(unit * 0.46), ms=int(unit * 0.33),
-                                             gf=max(14, int(unit * 0.32)), padding=PADDING))
+        self.load_css()
         self.build_keys()
 
     def build_keys(self):
         self.stop_repeat()
+        self.touches.clear()
         self.key_views = []
         while (child := self.keys.get_first_child()):
             self.keys.remove(child)
-        for row in (LETTERS if self.mode == "abc" else SYMBOLS):
+        for strip, row in [(True, STRIP)] + [(False, row) for row in PAGES[self.mode]]:
             hbox = Gtk.Box(spacing=GAP, halign=Gtk.Align.CENTER)
             for key in row:
                 label, action, width = (key, key, 1) if isinstance(key, str) else key
-                widget = Gtk.Label(label=label)
+                hint = HINTS.get(action) if not action.startswith("@") else None
+                widget = Gtk.Overlay()
+                main = Gtk.Label(label=label, hexpand=True, vexpand=True)
+                widget.set_child(main)
+                if hint is not None:
+                    corner = Gtk.Label(label=hint[0], halign=Gtk.Align.END, valign=Gtk.Align.START,
+                                       can_target=False)
+                    corner.add_css_class("hint")
+                    widget.add_overlay(corner)
                 widget.add_css_class("key")
-                if action.startswith("@"):
+                if action.startswith("@") and action != "@space":
                     widget.add_css_class("mod")
                 if action in {"@Return", "@BackSpace"}:
                     widget.add_css_class("primary")
-                widget.set_size_request(int((self.unit + GAP) * width - GAP), int(self.unit * 1.05))
-                self.tappable(widget, action)
-                self.key_views.append((widget, label, action))
+                widget.set_size_request(int((self.unit + GAP) * width - GAP), int(self.unit * (STRIP_HEIGHT if strip else 1.1)))
+                view = (widget, main, label, action, hint)
+                self.bind(view)
+                self.key_views.append(view)
                 hbox.append(widget)
             self.keys.append(hbox)
         self.update_keys()
@@ -345,7 +717,9 @@ class FloatKB(Gtk.Application):
 
     def update_keys(self):
         upper = self.shift or self.caps
-        for widget, label, action in self.key_views:
+        for widget, main, label, action, hint in self.key_views:
+            if widget in self.touches and self.touches[widget]["alt"]:
+                continue
             latched = (action == "@shift" and upper) or MODS.get(action) in self.mods
             if latched:
                 widget.add_css_class("latched")
@@ -355,14 +729,20 @@ class FloatKB(Gtk.Application):
                 label = "⇪"
             elif upper and action == label and label.isalpha():
                 label = label.upper()
-            if widget.get_label() != label:
-                widget.set_label(label)
+            if main.get_label() != label:
+                main.set_label(label)
 
     def set_expanded(self, expanded, save=True):
         self.state["expanded"] = expanded
         self.keys.set_visible(expanded)
-        self.btn_small.set_visible(expanded)
-        self.btn_big.set_visible(expanded)
+        self.grip.set_visible(expanded)
+        for widget, name in ((self.root, "collapsed"), (self.btn_fold, "pill")):
+            if expanded:
+                widget.remove_css_class(name)
+            else:
+                widget.add_css_class(name)
+        for b in self.expanded_only:
+            b.set_visible(expanded and (b is not self.btn_haptic or self.haptics.available))
         if expanded:
             self.btn_fold.set_label("Hide")
         else:
@@ -392,6 +772,7 @@ class FloatKB(Gtk.Application):
     # ---- moving -----------------------------------------------------------
     def begin_drag(self, *_):
         self.drag_origin = self.position
+        self.dragged = False
 
     def on_drag(self, gesture, dx, dy):
         # Gtk.GestureDrag reports total displacement from the beginning of
@@ -420,8 +801,8 @@ class FloatKB(Gtk.Application):
             width = child.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
             height = child.measure(Gtk.Orientation.VERTICAL, width)[1]
             left = min(left, geometry.width - width)
-            # The Noctalia tablet bar reserves 44 logical pixels at the bottom.
-            bottom = min(bottom, geometry.height - height - (44 if monitor == self.panel else 0))
+            # The Noctalia tablet bar reserves 56 logical pixels at the bottom.
+            bottom = min(bottom, geometry.height - height - (56 if monitor == self.panel else 0))
         self.position = (max(0, int(left)), max(0, int(bottom)))
         LS.set_margin(self.win, LS.Edge.LEFT, self.position[0])
         LS.set_margin(self.win, LS.Edge.BOTTOM, self.position[1])

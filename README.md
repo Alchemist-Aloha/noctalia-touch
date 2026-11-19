@@ -5,7 +5,7 @@ A touchscreen setup for Hyprland and Noctalia. It adds a tablet bar, a floating 
 ## Before you start
 
 - Use a working **Hyprland Lua** session and **Noctalia 5**. The package was built and checked with Hyprland 0.57.2 and Noctalia 5.5.0 on an ARM64 tablet.
-- Install **Python 3**, **PyGObject**, **GTK 4**, **gtk4-layer-shell** with its introspection data, and **wtype**. Autorotation also needs **jq**. The native swipe plugin also needs **Hyprland development headers**, **pkg-config**, and a **C++23 compiler**. Use `--no-swipes` to try the bar and keyboard without a compiler or plugin.
+- Install **Rust and Cargo 1.98+**, a C linker, **pkg-config**, the development libraries for **Wayland**, **XKB/X11**, and **Fontconfig**, a working **Vulkan driver**, and **wtype**. The installer builds the GPUI/GPUI Kit overlays from source. Autorotation also needs **jq**. The swipe plugin requires **Hyprland development headers** and a **C++23 compiler**; use `--no-swipes` to skip only the plugin build.
 - For autorotation, install **iio-sensor-proxy** and confirm that `monitor-sensor --accel` reports orientation changes.
 - Inside Hyprland, run `hyprctl monitors` to find the connector name and scale for the touchscreen. Common names are `DSI-1` on tablets and `eDP-1` on laptops. Keep a keyboard handy the first time you try the swipe plugin.
 
@@ -97,7 +97,9 @@ Sign out and back in to unload the plugin. If you want to roll back an upgrade, 
 
 - `hypr/` contains the Lua settings for scrolling layout, touch input, keybindings, optional autorotation, and plugin loading.
 - `noctalia/` contains the tablet bar, the optional rotation button and compact status bar, and the Material 3 palette template.
-- `bin/` contains the GTK floating keyboard, Float popup, and sensor rotation helper.
+- `src/` contains the Rust floating keyboard and Float popup. Both use GPUI Kit on Wayland layer shell and share the Noctalia Material 3 palette. The installer provides `bin/floatkb` and `bin/floatwindow` entry points to the same native binary.
+- `bin/autorotate` is the shell-based sensor rotation helper.
 - `plugin/` contains the swipe plugin source. The installer builds it against local Hyprland headers.
+- `vendor/gpui-fast-linux/` is the pinned Linux backend, patched to forward Wayland touchscreen contacts and expose layer margins, restacking, and output selection to the overlays.
 
 [Hyprland plugin documentation](https://wiki.hypr.land/hyprland-plugins/using-plugins/) · [Noctalia configuration documentation](https://docs.noctalia.dev/noctalia/configuration/)

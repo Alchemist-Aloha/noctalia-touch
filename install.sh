@@ -69,14 +69,10 @@ printf 'Tablet output: %s\nSwipes: %s\nAutorotation: %s (scale %s)\nCompact top 
 printf 'Install paths:\n  %s\n  %s\n  %s\n  %s\n' "$main" "$root" "$bar" "$colors"
 if "$dry_run"; then exit 0; fi
 
-for tool in python3 noctalia hyprctl wtype; do
+for tool in cargo noctalia hyprctl wtype; do
     command -v "$tool" >/dev/null || fail "missing $tool. See the README for dependencies."
 done
-python3 - <<'PYTHON' || fail "install Python GObject bindings, GTK 4 and gtk4-layer-shell introspection"
-import gi
-gi.require_version("Gtk", "4.0")
-gi.require_version("Gtk4LayerShell", "1.0")
-PYTHON
+
 if "$rotate"; then
     command -v monitor-sensor >/dev/null || fail "install iio-sensor-proxy for autorotation"
     command -v jq >/dev/null || fail "install jq for autorotation"
@@ -104,10 +100,13 @@ if "$compact"; then
     printf '\n' >> "$stage/noctalia-touch.toml"
     render "$src/noctalia/compact-top-bar.toml" >> "$stage/noctalia-touch.toml"
 fi
-for script in floatkb floatwindow autorotate; do
-    render "$src/bin/$script" > "$stage/$script"
-done
+render "$src/bin/autorotate" > "$stage/autorotate"
+printf '%s\n' "$output" > "$stage/output"
 noctalia config validate "$stage/noctalia-touch.toml"
+rust_target_dir=${CARGO_TARGET_DIR:-"$src/target"}
+[[ $rust_target_dir == /* ]] || rust_target_dir=$PWD/$rust_target_dir
+cargo build --locked --release --manifest-path "$src/Cargo.toml" \
+    --target-dir "$rust_target_dir" --bin noctalia-touch
 if "$swipes"; then
     command -v pkg-config >/dev/null && pkg-config --exists hyprland ||
         fail "Hyprland development headers are required for swipes. Install them or use --no-swipes."
@@ -130,7 +129,14 @@ done
 
 mkdir -p -- "$root/bin" "$(dirname -- "$colors")"
 install -m 644 "$stage/tablet.lua" "$root/tablet.lua"
-install -m 755 "$stage/"{floatkb,floatwindow,autorotate} "$root/bin/"
+install -m 755 "$stage/autorotate" "$root/bin/autorotate"
+install -m 644 "$stage/output" "$root/output"
+install -m 755 "$rust_target_dir/release/noctalia-touch" "$root/bin/noctalia-touch.new"
+mv -f -- "$root/bin/noctalia-touch.new" "$root/bin/noctalia-touch"
+for tool in floatkb floatwindow; do
+    ln -sfn -- noctalia-touch "$root/bin/$tool.new"
+    mv -Tf -- "$root/bin/$tool.new" "$root/bin/$tool"
+done
 if "$swipes"; then
     # Replacing the file keeps an already mapped plugin valid until the next login.
     install -m 644 "$stage/tablet-swipes.so" "$root/tablet-swipes.so.new"

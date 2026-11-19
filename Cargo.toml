@@ -1,0 +1,29 @@
+[package]
+name = "noctalia-touch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+evdev = "0.13"
+gpui-fast = { version = "=0.1.16", default-features = false }
+gpui_fast_linux = { package = "gpui-fast-linux", version = "=0.1.16", default-features = false, features = ["wayland"] }
+gpui-kit = { version = "=0.10.0", default-features = false, features = ["component", "gpui-fast"] }
+gpui-kit-material = { version = "=0.2.0", default-features = false, features = ["buttons", "gpui-fast"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = "debuginfo"
+
+[patch.crates-io]
+gpui-fast-linux = { path = "vendor/gpui-fast-linux" }
